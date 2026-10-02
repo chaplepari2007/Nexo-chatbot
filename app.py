@@ -1,3 +1,4 @@
+````python
 from flask import Flask, render_template, request, jsonify
 import requests
 import base64
@@ -17,8 +18,6 @@ app = Flask(__name__)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# Primary model + automatic fallbacks.
-# If one model is temporarily overloaded, NEXO tries the next one.
 GEMINI_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -34,19 +33,14 @@ MAX_RETRIES_PER_MODEL = 2
 
 
 # ============================================================
-# GEMINI API
+# GEMINI RESPONSE PARSER
 # ============================================================
 
 def extract_gemini_text(data):
-    """
-    Extract text from an Interactions API response.
+    """Extract text from Gemini Interactions API response."""
 
-    The API normally returns:
-    steps -> model_output -> content -> text
-    """
-
-    # Some responses may expose output_text directly.
     output_text = data.get("output_text")
+
     if isinstance(output_text, str) and output_text.strip():
         return output_text.strip()
 
@@ -82,21 +76,17 @@ def extract_gemini_text(data):
     return "\n".join(pieces).strip()
 
 
-def ask_gemini(prompt, image_data=None, mime_type=None):
-    """
-    Ask Gemini through the Interactions API.
+# ============================================================
+# ASK GEMINI
+# ============================================================
 
-    Handles temporary 503/429/408/5xx errors with
-    exponential backoff and automatic model fallback.
-    """
+def ask_gemini(prompt, image_data=None, mime_type=None):
 
     if not GEMINI_API_KEY:
         return {
             "response": "",
             "time": 0,
-            "error": (
-                "GEMINI_API_KEY is not configured on the server."
-            )
+            "error": "GEMINI_API_KEY is not configured on the server."
         }
 
     headers = {
@@ -104,7 +94,7 @@ def ask_gemini(prompt, image_data=None, mime_type=None):
         "x-goog-api-key": GEMINI_API_KEY
     }
 
-    # Build input.
+    # Text-only request
     if image_data:
         input_data = [
             {
@@ -128,6 +118,7 @@ def ask_gemini(prompt, image_data=None, mime_type=None):
         for attempt in range(MAX_RETRIES_PER_MODEL):
 
             try:
+
                 payload = {
                     "model": model,
                     "input": input_data
@@ -147,6 +138,7 @@ def ask_gemini(prompt, image_data=None, mime_type=None):
                 # ------------------------------------------------
 
                 if response.ok:
+
                     try:
                         data = response.json()
                     except Exception:
@@ -163,6 +155,7 @@ def ask_gemini(prompt, image_data=None, mime_type=None):
                     text = extract_gemini_text(data)
 
                     if text:
+
                         return {
                             "response": text,
                             "time": round(
@@ -188,13 +181,16 @@ def ask_gemini(prompt, image_data=None, mime_type=None):
                     or status == 429
                     or status >= 500
                 ):
+
                     try:
                         error_json = response.json()
+
                         error_message = (
                             error_json
                             .get("error", {})
                             .get("message", "")
                         )
+
                     except Exception:
                         error_message = response.text[:500]
 
@@ -203,26 +199,28 @@ def ask_gemini(prompt, image_data=None, mime_type=None):
                         f"{error_message}"
                     )
 
-                    # Exponential backoff with small jitter.
                     delay = (
                         (2 ** attempt)
                         + random.uniform(0.2, 0.8)
                     )
 
                     time.sleep(delay)
+
                     continue
 
                 # ------------------------------------------------
-                # PERMANENT CLIENT ERROR
+                # PERMANENT ERROR
                 # ------------------------------------------------
 
                 try:
                     error_json = response.json()
+
                     error_message = (
                         error_json
                         .get("error", {})
                         .get("message", "")
                     )
+
                 except Exception:
                     error_message = response.text[:1000]
 
@@ -239,6 +237,7 @@ def ask_gemini(prompt, image_data=None, mime_type=None):
                 }
 
             except requests.exceptions.Timeout:
+
                 errors.append(
                     f"{model}: request timed out"
                 )
@@ -251,6 +250,7 @@ def ask_gemini(prompt, image_data=None, mime_type=None):
                 time.sleep(delay)
 
             except requests.exceptions.ConnectionError:
+
                 errors.append(
                     f"{model}: connection error"
                 )
@@ -263,6 +263,7 @@ def ask_gemini(prompt, image_data=None, mime_type=None):
                 time.sleep(delay)
 
             except Exception as e:
+
                 errors.append(
                     f"{model}: {str(e)}"
                 )
@@ -279,8 +280,8 @@ def ask_gemini(prompt, image_data=None, mime_type=None):
         "time": total_time,
         "error": (
             "Gemini is temporarily unavailable after "
-            "automatic retries and fallback models. "
-            "Please try again in a moment.\n\n"
+            "automatic retries and fallback models."
+            "\n\n"
             + "\n".join(errors[-8:])
         )
     }
@@ -467,7 +468,7 @@ IMPORTANT RULES:
 14. Do not force complexity for topics where it is irrelevant.
 15. Give practical applications whenever appropriate.
 16. Keep answers educational and well structured.
-17. For mathematical problems, show the actual calculation.
+17. For mathematical problems, show actual calculation.
 18. For engineering topics, explain the working principle.
 19. For programming questions, make code runnable when practical.
 
@@ -826,6 +827,11 @@ def chat():
         GEMINI_MODELS[0]
     )
 
+    # IMPORTANT:
+    # The existing frontend expects a top-level
+    # "response" property.
+    answer["response"] = answer["theory"]
+
     return jsonify(answer)
 
 
@@ -1127,3 +1133,6 @@ if __name__ == "__main__":
         port=port,
         debug=False
     )
+````
+
+
