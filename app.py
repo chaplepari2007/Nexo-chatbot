@@ -7,6 +7,7 @@ import urllib.parse
 import subprocess
 import tempfile
 import os
+import random
 
 app = Flask(__name__)
 
@@ -16,25 +17,85 @@ app = Flask(__name__)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-GEMINI_MODEL = "gemini-3.8-flash"
+# Primary model + automatic fallbacks.
+# If one model is temporarily overloaded, NEXO tries the next one.
+GEMINI_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+]
 
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/interactions"
 )
+
+MAX_RETRIES_PER_MODEL = 2
 
 
 # ============================================================
 # GEMINI API
 # ============================================================
 
+def extract_gemini_text(data):
+    """
+    Extract text from an Interactions API response.
+
+    The API normally returns:
+    steps -> model_output -> content -> text
+    """
+
+    # Some responses may expose output_text directly.
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    steps = data.get("steps", [])
+
+    if not isinstance(steps, list):
+        return ""
+
+    pieces = []
+
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+
+        if step.get("type") != "model_output":
+            continue
+
+        content = step.get("content", [])
+
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+
+            if block.get("type") == "text":
+                text = block.get("text", "")
+
+                if isinstance(text, str) and text.strip():
+                    pieces.append(text.strip())
+
+    return "\n".join(pieces).strip()
+
+
 def ask_gemini(prompt, image_data=None, mime_type=None):
+    """
+    Ask Gemini through the Interactions API.
+
+    Handles temporary 503/429/408/5xx errors with
+    exponential backoff and automatic model fallback.
+    """
 
     if not GEMINI_API_KEY:
         return {
             "response": "",
             "time": 0,
             "error": (
-                "GEMINI_API_KEY is not configured on Render."
+                "GEMINI_API_KEY is not configured on the server."
             )
         }
 
@@ -43,144 +104,186 @@ def ask_gemini(prompt, image_data=None, mime_type=None):
         "x-goog-api-key": GEMINI_API_KEY
     }
 
-    # Normal text request
-    if not image_data:
-
-        payload = {
-            "model": GEMINI_MODEL,
-            "input": prompt
-        }
-
-    # Image + text request
+    # Build input.
+    if image_data:
+        input_data = [
+            {
+                "type": "image",
+                "data": image_data,
+                "mime_type": mime_type or "image/jpeg"
+            },
+            {
+                "type": "text",
+                "text": prompt
+            }
+        ]
     else:
+        input_data = prompt
 
-        payload = {
-            "model": GEMINI_MODEL,
-            "input": [
-                {
-                    "type": "text",
-                    "text": prompt
-                },
-                {
-                    "type": "image",
-                    "data": image_data,
-                    "mime_type": mime_type or "image/jpeg"
-                }
-            ]
-        }
+    start_total = time.time()
+    errors = []
 
-    try:
+    for model in GEMINI_MODELS:
 
-        start = time.time()
-
-        response = requests.post(
-            GEMINI_URL,
-            headers=headers,
-            json=payload,
-            timeout=180
-        )
-
-        elapsed = round(
-            time.time() - start,
-            2
-        )
-
-        if not response.ok:
+        for attempt in range(MAX_RETRIES_PER_MODEL):
 
             try:
-                error_data = response.json()
+                payload = {
+                    "model": model,
+                    "input": input_data
+                }
 
-                error_message = (
-                    error_data
-                    .get("error", {})
-                    .get("message", response.text)
+                response = requests.post(
+                    GEMINI_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=90
                 )
 
-            except Exception:
+                status = response.status_code
 
-                error_message = response.text
+                # ------------------------------------------------
+                # SUCCESS
+                # ------------------------------------------------
 
-            return {
-                "response": "",
-                "time": elapsed,
-                "error": (
-                    f"Gemini API error "
-                    f"({response.status_code}): "
-                    f"{error_message}"
-                )
-            }
+                if response.ok:
+                    try:
+                        data = response.json()
+                    except Exception:
+                        return {
+                            "response": "",
+                            "time": round(
+                                time.time() - start_total,
+                                2
+                            ),
+                            "error":
+                                "Gemini returned an invalid response."
+                        }
 
-        data = response.json()
+                    text = extract_gemini_text(data)
 
-        # Current Interactions API response
-        # contains model_output steps.
-        output_text = ""
+                    if text:
+                        return {
+                            "response": text,
+                            "time": round(
+                                time.time() - start_total,
+                                2
+                            ),
+                            "error": None,
+                            "model": model
+                        }
 
-        for step in data.get("steps", []):
-
-            if step.get("type") != "model_output":
-                continue
-
-            for content in step.get(
-                "content",
-                []
-            ):
-
-                if content.get("type") == "text":
-
-                    output_text += content.get(
-                        "text",
-                        ""
+                    errors.append(
+                        f"{model}: empty response"
                     )
 
-        output_text = output_text.strip()
+                    break
 
-        if not output_text:
+                # ------------------------------------------------
+                # TEMPORARY ERROR
+                # ------------------------------------------------
 
-            return {
-                "response": "",
-                "time": elapsed,
-                "error": (
-                    "Gemini returned an empty answer."
+                if (
+                    status == 408
+                    or status == 429
+                    or status >= 500
+                ):
+                    try:
+                        error_json = response.json()
+                        error_message = (
+                            error_json
+                            .get("error", {})
+                            .get("message", "")
+                        )
+                    except Exception:
+                        error_message = response.text[:500]
+
+                    errors.append(
+                        f"{model} ({status}): "
+                        f"{error_message}"
+                    )
+
+                    # Exponential backoff with small jitter.
+                    delay = (
+                        (2 ** attempt)
+                        + random.uniform(0.2, 0.8)
+                    )
+
+                    time.sleep(delay)
+                    continue
+
+                # ------------------------------------------------
+                # PERMANENT CLIENT ERROR
+                # ------------------------------------------------
+
+                try:
+                    error_json = response.json()
+                    error_message = (
+                        error_json
+                        .get("error", {})
+                        .get("message", "")
+                    )
+                except Exception:
+                    error_message = response.text[:1000]
+
+                return {
+                    "response": "",
+                    "time": round(
+                        time.time() - start_total,
+                        2
+                    ),
+                    "error": (
+                        f"Gemini API error ({status}): "
+                        f"{error_message}"
+                    )
+                }
+
+            except requests.exceptions.Timeout:
+                errors.append(
+                    f"{model}: request timed out"
                 )
-            }
 
-        return {
-            "response": output_text,
-            "time": elapsed,
-            "error": None
-        }
+                delay = (
+                    (2 ** attempt)
+                    + random.uniform(0.2, 0.8)
+                )
 
-    except requests.exceptions.Timeout:
+                time.sleep(delay)
 
-        return {
-            "response": "",
-            "time": 0,
-            "error": (
-                "Gemini took too long to respond."
-            )
-        }
+            except requests.exceptions.ConnectionError:
+                errors.append(
+                    f"{model}: connection error"
+                )
 
-    except requests.exceptions.ConnectionError:
+                delay = (
+                    (2 ** attempt)
+                    + random.uniform(0.2, 0.8)
+                )
 
-        return {
-            "response": "",
-            "time": 0,
-            "error": (
-                "Could not connect to Gemini API."
-            )
-        }
+                time.sleep(delay)
 
-    except Exception as e:
+            except Exception as e:
+                errors.append(
+                    f"{model}: {str(e)}"
+                )
 
-        return {
-            "response": "",
-            "time": 0,
-            "error": (
-                "Gemini connection error: "
-                + str(e)
-            )
-        }
+                break
+
+    total_time = round(
+        time.time() - start_total,
+        2
+    )
+
+    return {
+        "response": "",
+        "time": total_time,
+        "error": (
+            "Gemini is temporarily unavailable after "
+            "automatic retries and fallback models. "
+            "Please try again in a moment.\n\n"
+            + "\n".join(errors[-8:])
+        )
+    }
 
 
 # ============================================================
@@ -191,64 +294,78 @@ def analyze_question(question):
 
     q = question.lower()
 
-    programming = any(x in q for x in [
-        "code",
-        "program",
-        "python",
-        "java",
-        "c language",
-        "c++",
-        "javascript",
-        "implement",
-        "write a program",
-        "algorithm",
-        "debug",
-        "sort",
-        "search",
-        "stack",
-        "queue",
-        "linked list",
-        "tree",
-        "graph",
-        "recursion"
-    ])
+    programming = any(
+        x in q
+        for x in [
+            "code",
+            "program",
+            "python",
+            "java",
+            "c language",
+            "c++",
+            "javascript",
+            "implement",
+            "write a program",
+            "algorithm",
+            "debug",
+            "sort",
+            "search",
+            "stack",
+            "queue",
+            "linked list",
+            "tree",
+            "graph",
+            "recursion"
+        ]
+    )
 
-    numerical = any(x in q for x in [
-        "solve",
-        "calculate",
-        "find",
-        "equation",
-        "numerical",
-        "compute",
-        "value of",
-        "determine"
-    ])
+    numerical = any(
+        x in q
+        for x in [
+            "solve",
+            "calculate",
+            "find",
+            "equation",
+            "numerical",
+            "compute",
+            "value of",
+            "determine"
+        ]
+    )
 
-    diagram = any(x in q for x in [
-        "diagram",
-        "architecture",
-        "circuit",
-        "flowchart",
-        "motor",
-        "engine",
-        "beam",
-        "truss",
-        "transformer",
-        "osi",
-        "tcp",
-        "network",
-        "process",
-        "working",
-        "structure",
-        "block diagram"
-    ])
+    diagram = any(
+        x in q
+        for x in [
+            "diagram",
+            "architecture",
+            "circuit",
+            "flowchart",
+            "motor",
+            "engine",
+            "beam",
+            "truss",
+            "osi",
+            "tcp",
+            "network",
+            "process",
+            "working",
+            "structure",
+            "block diagram"
+        ]
+    )
 
-    complexity = programming or any(x in q for x in [
-        "complexity",
-        "big o",
-        "time complexity",
-        "space complexity"
-    ])
+    complexity = (
+        programming
+        or any(
+            x in q
+            for x in [
+                "complexity",
+                "big o",
+                "time complexity",
+                "space complexity"
+            ]
+        )
+    )
 
     topics = [
         "binary search",
@@ -270,7 +387,11 @@ def analyze_question(question):
     ]
 
     interactive = next(
-        (x for x in topics if x in q),
+        (
+            x
+            for x in topics
+            if x in q
+        ),
         None
     )
 
@@ -293,18 +414,18 @@ def analyze_question(question):
 
 
 # ============================================================
-# NEXO PROMPT
+# EDUCATIONAL PROMPT
 # ============================================================
 
 def build_prompt(question):
 
-    prompt = """
+    return f"""
 You are NEXO, a general educational assistant for college students.
 
 You can answer questions from:
 
-CSE
 Computer Science
+CSE
 IT
 Civil Engineering
 Mechanical Engineering
@@ -319,7 +440,7 @@ Science
 and other academic subjects.
 
 Question:
-QUESTION_PLACEHOLDER
+{question}
 
 Create a clear, accurate and beginner-friendly educational solution.
 
@@ -345,8 +466,12 @@ IMPORTANT RULES:
 13. Do not force code for non-programming questions.
 14. Do not force complexity for topics where it is irrelevant.
 15. Give practical applications whenever appropriate.
-16. Make Mermaid diagrams valid.
-17. Keep the headings EXACTLY as shown below.
+16. Keep answers educational and well structured.
+17. For mathematical problems, show the actual calculation.
+18. For engineering topics, explain the working principle.
+19. For programming questions, make code runnable when practical.
+
+Keep the headings EXACTLY as shown below.
 
 [TITLE]
 topic title
@@ -396,14 +521,9 @@ short YouTube educational search phrase
 [END]
 """
 
-    return prompt.replace(
-        "QUESTION_PLACEHOLDER",
-        question
-    )
-
 
 # ============================================================
-# TEXT CLEANING
+# RESPONSE PARSING
 # ============================================================
 
 def clean_fence(value):
@@ -444,10 +564,6 @@ def extract_section(text, name):
         else ""
     )
 
-
-# ============================================================
-# PARSE ANSWER
-# ============================================================
 
 def parse_answer(raw, question):
 
@@ -514,16 +630,12 @@ def parse_answer(raw, question):
     if diagram.upper() == "NONE":
         diagram = ""
     else:
-        diagram = clean_fence(
-            diagram
-        )
+        diagram = clean_fence(diagram)
 
     if code.upper() == "NONE":
         code = ""
     else:
-        code = clean_fence(
-            code
-        )
+        code = clean_fence(code)
 
     if output.upper() == "NONE":
         output = ""
@@ -657,14 +769,20 @@ def home():
 )
 def chat():
 
-    data = request.get_json(
-        silent=True
-    ) or {}
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
-    question = data.get(
-        "message",
-        ""
-    ).strip()
+    question = (
+        data.get(
+            "message",
+            ""
+        )
+        .strip()
+    )
 
     if not question:
 
@@ -694,7 +812,8 @@ def chat():
     )
 
     answer["videoUrl"] = (
-        "https://www.youtube.com/results?search_query="
+        "https://www.youtube.com/results"
+        "?search_query="
         + query
     )
 
@@ -702,11 +821,16 @@ def chat():
         result["time"]
     )
 
+    answer["model"] = result.get(
+        "model",
+        GEMINI_MODELS[0]
+    )
+
     return jsonify(answer)
 
 
 # ============================================================
-# IMAGE QUESTION
+# IMAGE / VISION
 # ============================================================
 
 @app.route(
@@ -719,10 +843,13 @@ def vision():
         "image"
     )
 
-    question = request.form.get(
-        "question",
-        ""
-    ).strip()
+    question = (
+        request.form.get(
+            "question",
+            ""
+        )
+        .strip()
+    )
 
     if not image_file:
 
@@ -764,14 +891,19 @@ You are NEXO, an educational assistant.
 Analyze the uploaded educational image.
 
 User question:
-{question or "Explain and solve what is shown in the image."}
+{
+    question
+    or
+    "Explain and solve what is shown in the image."
+}
 
-Give a proper solution.
+Give a proper educational solution.
 
 If it is mathematics:
 - identify the problem
 - solve step-by-step
 - show formulas
+- show calculation
 - show final answer
 
 If it is programming:
@@ -807,12 +939,21 @@ Use clear educational language.
     return jsonify({
         "response":
             result["response"],
+
         "responseTime":
             result["time"],
+
+        "model":
+            result.get(
+                "model",
+                GEMINI_MODELS[0]
+            ),
+
         "analysis":
             analyze_question(
                 question
-                or "image question"
+                or
+                "image question"
             )
     })
 
@@ -827,13 +968,25 @@ def health():
     return jsonify({
         "gemini":
             bool(GEMINI_API_KEY),
-        "model":
-            GEMINI_MODEL
+
+        "primaryModel":
+            GEMINI_MODELS[0],
+
+        "fallbackModels":
+            GEMINI_MODELS[1:],
+
+        "api":
+            "Interactions API",
+
+        "status":
+            "ready"
+            if GEMINI_API_KEY
+            else "missing API key"
     })
 
 
 # ============================================================
-# PYTHON CODE RUNNER
+# SAFE PYTHON RUNNER
 # ============================================================
 
 @app.route(
@@ -842,9 +995,12 @@ def health():
 )
 def run_python():
 
-    data = request.get_json(
-        silent=True
-    ) or {}
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
     code = data.get(
         "code",
@@ -959,8 +1115,15 @@ def run_python():
 
 if __name__ == "__main__":
 
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
+
     app.run(
-        host="127.0.0.1",
-        port=5000,
-        debug=True
+        host="0.0.0.0",
+        port=port,
+        debug=False
     )
