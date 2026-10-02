@@ -10,87 +10,232 @@ import os
 
 app = Flask(__name__)
 
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+# ============================================================
+# GEMINI CONFIGURATION
+# ============================================================
 
-TEXT_MODEL = "qwen2.5:0.5b"
-VISION_MODEL = "qwen2.5vl:3b"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# Gemini model for text and image questions
+GEMINI_TEXT_MODEL = "gemini-2.5-flash"
+GEMINI_VISION_MODEL = "gemini-2.5-flash"
+
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "{model}:generateContent"
+)
 
 
-def ask_ollama(prompt, model=TEXT_MODEL, image=None):
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False
+# ============================================================
+# GEMINI AI FUNCTION
+# ============================================================
+
+def ask_gemini(prompt, model=GEMINI_TEXT_MODEL, image_data=None, mime_type=None):
+
+    if not GEMINI_API_KEY:
+        return {
+            "response": "",
+            "time": 0,
+            "error": (
+                "GEMINI_API_KEY is not configured on Render. "
+                "Open Render → Environment and add GEMINI_API_KEY."
+            )
+        }
+
+    url = GEMINI_URL.format(model=model)
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
     }
 
-    if image:
-        payload["images"] = [image]
+    parts = [
+        {
+            "text": prompt
+        }
+    ]
+
+    # Add image when supplied
+    if image_data:
+        parts.append({
+            "inline_data": {
+                "mime_type": mime_type or "image/jpeg",
+                "data": image_data
+            }
+        })
+
+    payload = {
+        "contents": [
+            {
+                "parts": parts
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 6000
+        }
+    }
 
     try:
+
         start = time.time()
 
         r = requests.post(
-            OLLAMA_URL,
+            url,
+            headers=headers,
             json=payload,
             timeout=180
         )
 
         elapsed = round(time.time() - start, 2)
 
-        r.raise_for_status()
+        if not r.ok:
+
+            try:
+                error_data = r.json()
+                error_message = (
+                    error_data
+                    .get("error", {})
+                    .get("message", r.text)
+                )
+            except Exception:
+                error_message = r.text
+
+            return {
+                "response": "",
+                "time": elapsed,
+                "error": (
+                    f"Gemini API error ({r.status_code}): "
+                    f"{error_message}"
+                )
+            }
+
+        data = r.json()
+
+        candidates = data.get("candidates", [])
+
+        if not candidates:
+            return {
+                "response": "",
+                "time": elapsed,
+                "error": "Gemini returned no answer."
+            }
+
+        response_text = ""
+
+        content = candidates[0].get("content", {})
+        response_parts = content.get("parts", [])
+
+        for part in response_parts:
+
+            if "text" in part:
+                response_text += part["text"]
+
+        response_text = response_text.strip()
+
+        if not response_text:
+            return {
+                "response": "",
+                "time": elapsed,
+                "error": "Gemini returned an empty answer."
+            }
 
         return {
-            "response": r.json().get("response", ""),
+            "response": response_text,
             "time": elapsed,
             "error": None
         }
 
-    except requests.exceptions.ConnectionError:
+    except requests.exceptions.Timeout:
+
         return {
             "response": "",
             "time": 0,
-            "error": "Ollama is not running. Start Ollama first."
+            "error": "Gemini took too long to respond."
         }
 
-    except requests.exceptions.Timeout:
+    except requests.exceptions.ConnectionError:
+
         return {
             "response": "",
             "time": 0,
-            "error": "Ollama took too long to respond."
+            "error": "Could not connect to Gemini API."
         }
 
     except Exception as e:
+
         return {
             "response": "",
             "time": 0,
-            "error": str(e)
+            "error": "Gemini connection error: " + str(e)
         }
 
 
+# ============================================================
+# QUESTION ANALYSIS
+# ============================================================
+
 def analyze_question(question):
+
     q = question.lower()
 
     programming = any(x in q for x in [
-        "code", "program", "python", "java", "c language",
-        "c++", "javascript", "implement", "write a program",
-        "algorithm", "debug", "sort", "search", "stack",
-        "queue", "linked list", "tree", "graph", "recursion"
+        "code",
+        "program",
+        "python",
+        "java",
+        "c language",
+        "c++",
+        "javascript",
+        "implement",
+        "write a program",
+        "algorithm",
+        "debug",
+        "sort",
+        "search",
+        "stack",
+        "queue",
+        "linked list",
+        "tree",
+        "graph",
+        "recursion"
     ])
 
     numerical = any(x in q for x in [
-        "solve", "calculate", "find", "equation", "numerical",
-        "compute", "value of", "determine"
+        "solve",
+        "calculate",
+        "find",
+        "equation",
+        "numerical",
+        "compute",
+        "value of",
+        "determine"
     ])
 
     diagram = any(x in q for x in [
-        "diagram", "architecture", "circuit", "flowchart",
-        "motor", "engine", "beam", "truss", "transformer",
-        "osi", "tcp", "network", "process", "working",
-        "structure", "block diagram"
+        "diagram",
+        "architecture",
+        "circuit",
+        "flowchart",
+        "motor",
+        "engine",
+        "beam",
+        "truss",
+        "transformer",
+        "osi",
+        "tcp",
+        "network",
+        "process",
+        "working",
+        "structure",
+        "block diagram"
     ])
 
     complexity = programming or any(x in q for x in [
-        "complexity", "big o", "time complexity", "space complexity"
+        "complexity",
+        "big o",
+        "time complexity",
+        "space complexity"
     ])
 
     topics = [
@@ -135,7 +280,12 @@ def analyze_question(question):
     }
 
 
+# ============================================================
+# NEXO PROMPT
+# ============================================================
+
 def build_prompt(question):
+
     prompt = """
 You are NEXO, a general educational assistant for college students.
 
@@ -183,8 +333,9 @@ IMPORTANT RULES:
 13. Do not force code for non-programming questions.
 14. Do not force complexity for topics where it is irrelevant.
 15. Give practical applications whenever appropriate.
-
-Keep the headings EXACTLY as shown below.
+16. Make sure the Mermaid diagram is valid Mermaid syntax.
+17. Do not put explanations outside the requested sections.
+18. Keep the headings EXACTLY as shown below.
 
 [TITLE]
 topic title
@@ -240,7 +391,12 @@ short YouTube educational search phrase
     )
 
 
+# ============================================================
+# TEXT CLEANING
+# ============================================================
+
 def clean_fence(value):
+
     value = value.strip()
 
     value = re.sub(
@@ -259,6 +415,7 @@ def clean_fence(value):
 
 
 def extract_section(text, name):
+
     pattern = (
         rf"\[{re.escape(name)}\]\s*"
         rf"(.*?)(?=\n\[[A-Z_]+\]|\Z)"
@@ -273,7 +430,12 @@ def extract_section(text, name):
     return m.group(1).strip() if m else ""
 
 
+# ============================================================
+# PARSE AI ANSWER
+# ============================================================
+
 def parse_answer(raw, question):
+
     title = extract_section(raw, "TITLE") or question[:80]
     theory = extract_section(raw, "THEORY")
     steps = extract_section(raw, "STEPS")
@@ -287,28 +449,35 @@ def parse_answer(raw, question):
     summary = extract_section(raw, "SUMMARY")
     video_query = extract_section(raw, "VIDEO_QUERY")
 
+    # Diagram
     if diagram.upper() == "NONE":
         diagram = ""
     else:
         diagram = clean_fence(diagram)
 
+    # Code
     if code.upper() == "NONE":
         code = ""
     else:
         code = clean_fence(code)
 
+    # Output
     if output.upper() == "NONE":
         output = ""
 
+    # Complexity
     if complexity.upper() == "NONE":
         complexity = ""
 
+    # Fallback
     if not theory:
         theory = raw
 
+    # Steps
     step_list = []
 
     for line in steps.splitlines():
+
         line = line.strip()
 
         if not line:
@@ -323,9 +492,11 @@ def parse_answer(raw, question):
         if line:
             step_list.append(line)
 
+    # Algorithm
     algorithm_list = []
 
     for line in algorithm.splitlines():
+
         line = line.strip()
 
         if not line:
@@ -340,9 +511,11 @@ def parse_answer(raw, question):
         if line:
             algorithm_list.append(line)
 
+    # Applications
     app_list = []
 
     for line in applications.splitlines():
+
         line = line.strip()
 
         if not line:
@@ -363,7 +536,11 @@ def parse_answer(raw, question):
     analysis["run"] = bool(code)
     analysis["output"] = bool(output)
     analysis["diagram"] = bool(diagram) or analysis["diagram"]
-    analysis["complexity"] = bool(complexity) or analysis["complexity"]
+    analysis["complexity"] = (
+        bool(complexity)
+        or analysis["complexity"]
+    )
+
     analysis["interactive"] = bool(
         analysis["interactiveTopic"]
     )
@@ -385,14 +562,28 @@ def parse_answer(raw, question):
     }
 
 
+# ============================================================
+# HOME
+# ============================================================
+
 @app.route("/")
 def home():
-    return render_template("index.html")
 
+    return render_template(
+        "index.html"
+    )
+
+
+# ============================================================
+# CHAT
+# ============================================================
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    data = request.get_json(silent=True) or {}
+
+    data = request.get_json(
+        silent=True
+    ) or {}
 
     question = data.get(
         "message",
@@ -400,15 +591,19 @@ def chat():
     ).strip()
 
     if not question:
+
         return jsonify({
             "error": "Please enter a question."
         }), 400
 
-    result = ask_ollama(
-        build_prompt(question)
+    # Gemini instead of Ollama
+    result = ask_gemini(
+        build_prompt(question),
+        model=GEMINI_TEXT_MODEL
     )
 
     if result["error"]:
+
         return jsonify({
             "error": result["error"]
         }), 503
@@ -432,9 +627,16 @@ def chat():
     return jsonify(answer)
 
 
+# ============================================================
+# IMAGE / VISION
+# ============================================================
+
 @app.route("/vision", methods=["POST"])
 def vision():
-    image_file = request.files.get("image")
+
+    image_file = request.files.get(
+        "image"
+    )
 
     question = request.form.get(
         "question",
@@ -442,6 +644,7 @@ def vision():
     ).strip()
 
     if not image_file:
+
         return jsonify({
             "error": "Please select an image."
         }), 400
@@ -454,6 +657,7 @@ def vision():
     ]
 
     if image_file.content_type not in allowed:
+
         return jsonify({
             "error": "Please use PNG, JPG or WEBP."
         }), 400
@@ -461,6 +665,7 @@ def vision():
     image_data = image_file.read()
 
     if len(image_data) > 8 * 1024 * 1024:
+
         return jsonify({
             "error": "Image must be smaller than 8 MB."
         }), 400
@@ -502,17 +707,17 @@ clearly say that instead of guessing.
 Use clear educational language.
 """
 
-    result = ask_ollama(
+    result = ask_gemini(
         prompt,
-        model=VISION_MODEL,
-        image=encoded
+        model=GEMINI_VISION_MODEL,
+        image_data=encoded,
+        mime_type=image_file.content_type
     )
 
     if result["error"]:
+
         return jsonify({
             "error": result["error"]
-            + "\n\nFor image questions install:\n"
-            + "ollama pull qwen2.5vl:3b"
         }), 503
 
     return jsonify({
@@ -524,52 +729,30 @@ Use clear educational language.
     })
 
 
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
 @app.route("/health")
 def health():
-    result = {
-        "ollama": False,
-        "textModel": False,
-        "visionModel": False
-    }
 
-    try:
-        r = requests.get(
-            "http://127.0.0.1:11434/api/tags",
-            timeout=5
-        )
+    return jsonify({
+        "gemini": bool(GEMINI_API_KEY),
+        "textModel": GEMINI_TEXT_MODEL,
+        "visionModel": GEMINI_VISION_MODEL
+    })
 
-        if r.ok:
-            result["ollama"] = True
 
-            names = [
-                m.get("name", "")
-                for m in r.json().get(
-                    "models",
-                    []
-                )
-            ]
-
-            result["textModel"] = any(
-                n == TEXT_MODEL
-                or n.startswith(TEXT_MODEL + ":")
-                for n in names
-            )
-
-            result["visionModel"] = any(
-                n == VISION_MODEL
-                or n.startswith(VISION_MODEL + ":")
-                for n in names
-            )
-
-    except Exception:
-        pass
-
-    return jsonify(result)
-
+# ============================================================
+# PYTHON CODE RUNNER
+# ============================================================
 
 @app.route("/run-python", methods=["POST"])
 def run_python():
-    data = request.get_json(silent=True) or {}
+
+    data = request.get_json(
+        silent=True
+    ) or {}
 
     code = data.get(
         "code",
@@ -577,6 +760,7 @@ def run_python():
     )
 
     if not code.strip():
+
         return jsonify({
             "output": "No code provided."
         })
@@ -605,12 +789,14 @@ def run_python():
         item in low
         for item in blocked
     ):
+
         return jsonify({
             "output":
                 "Execution blocked: unsafe operation detected."
         })
 
     try:
+
         with tempfile.TemporaryDirectory() as d:
 
             path = os.path.join(
@@ -623,6 +809,7 @@ def run_python():
                 "w",
                 encoding="utf-8"
             ) as f:
+
                 f.write(code)
 
             p = subprocess.run(
@@ -640,6 +827,7 @@ def run_python():
             )
 
             if not output.strip():
+
                 output = (
                     "Program finished without printed output."
                 )
@@ -649,19 +837,26 @@ def run_python():
             })
 
     except subprocess.TimeoutExpired:
+
         return jsonify({
             "output":
                 "Execution stopped: time limit exceeded."
         })
 
     except Exception as e:
+
         return jsonify({
             "output":
                 "Runner error: " + str(e)
         })
 
 
+# ============================================================
+# LOCAL DEVELOPMENT
+# ============================================================
+
 if __name__ == "__main__":
+
     app.run(
         host="127.0.0.1",
         port=5000,
